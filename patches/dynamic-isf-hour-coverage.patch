@@ -1,0 +1,138 @@
+diff --git a/Trio/Sources/APS/Storage/TDDStorage.swift b/Trio/Sources/APS/Storage/TDDStorage.swift
+index cb8e67588..4f6b928e7 100644
+--- a/Trio/Sources/APS/Storage/TDDStorage.swift
++++ b/Trio/Sources/APS/Storage/TDDStorage.swift
+@@ -415,15 +415,24 @@ final class BaseTDDStorage: TDDStorage, Injectable {
+ 
+     /// Checks if there is enough Total Daily Dose (TDD) data collected over the past 7 days.
+     ///
+-    /// This function performs a count fetch for TDDStored records in Core Data where:
++    /// LOCAL PATCH (schencktechlabs): hour-coverage check instead of a raw sample count.
++    ///
++    /// Fetches the dates of TDDStored records in Core Data where:
+     /// - The record's date is within the last 7 days.
+     /// - The total value is greater than 0.
+     ///
+-    /// It then checks if at least 75% of the expected data points are present,
+-    /// assuming at least 288 expected entries per day (one every 5 minutes).
++    /// The 7-day window is split into 168 one-hour buckets. An hour counts as covered when
++    /// it holds at least `minSamplesPerHour` records (half of the 12 possible 5-minute loop
++    /// cycles). Dynamic ISF is allowed when at least 75% of the 168 hours are covered.
++    ///
++    /// Why: every TDDStored record is a full 24-hour total built from pump history, and the
++    /// TDD averages are SUM/COUNT over those records, so loop cycles skipped because a CGM
++    /// reading arrived late or repeated (passive G7) do not make the TDD less accurate.
++    /// Upstream required 75% of all 2,016 five-minute samples, which scattered skipped
++    /// cycles can block indefinitely even when pump history is complete.
+     ///
+     /// - Returns: `true` if sufficient TDD data is available, otherwise `false`.
+-    /// - Throws: An error if the Core Data count operation fails.
++    /// - Throws: An error if the Core Data fetch fails.
+     func hasSufficientTDD() async throws -> Bool {
+         let context = makeContext()
+         context.name = "hasSufficientTDD"
+@@ -433,16 +442,35 @@ final class BaseTDDStorage: TDDStorage, Injectable {
+     /// internal function with context exposed to enable testing
+     static func hasSufficientTDD(context: NSManagedObjectContext) async throws -> Bool {
+         try await context.perform {
+-            let fetchRequest = NSFetchRequest<NSFetchRequestResult>(entityName: "TDDStored")
++            let now = Date()
++            let hoursInWindow = 7 * 24
++            let minSamplesPerHour = 6
++            let requiredCoveredHours = Int(Double(hoursInWindow) * 0.75)
++
++            let fetchRequest = NSFetchRequest<NSDictionary>(entityName: "TDDStored")
++            fetchRequest.resultType = .dictionaryResultType
++            fetchRequest.propertiesToFetch = ["date"]
+             fetchRequest.predicate = NSPredicate(
+                 format: "date > %@ AND total > 0",
+-                Date().addingTimeInterval(-86400 * 7) as NSDate
++                now.addingTimeInterval(-3600 * Double(hoursInWindow)) as NSDate
+             )
+-            fetchRequest.resultType = .countResultType
+ 
+-            let count = try context.count(for: fetchRequest)
+-            let threshold = Int(Double(7 * 288) * 0.75)
+-            return count >= threshold
++            let rows = try context.fetch(fetchRequest)
++
++            var samplesPerHour = [Int](repeating: 0, count: hoursInWindow)
++            for row in rows {
++                guard let date = row["date"] as? Date else { continue }
++                let hourIndex = max(0, Int(now.timeIntervalSince(date) / 3600))
++                guard hourIndex < hoursInWindow else { continue }
++                samplesPerHour[hourIndex] += 1
++            }
++
++            let coveredHours = samplesPerHour.filter { $0 >= minSamplesPerHour }.count
++            debug(
++                .apsManager,
++                "TDD coverage for Dynamic ISF: \(coveredHours)/\(hoursInWindow) hours covered (need \(requiredCoveredHours)), \(rows.count) records"
++            )
++            return coveredHours >= requiredCoveredHours
+         }
+     }
+ }
+diff --git a/TrioTests/DynamicISFEnableTests.swift b/TrioTests/DynamicISFEnableTests.swift
+index 9daebb575..df89d1d39 100644
+--- a/TrioTests/DynamicISFEnableTests.swift
++++ b/TrioTests/DynamicISFEnableTests.swift
+@@ -45,4 +45,58 @@ import Testing
+         let enabled = try await testEnableLogic(percentSamples: 0.7)
+         #expect(!enabled)
+     }
++
++    // LOCAL PATCH (schencktechlabs): hour-coverage tests
++
++    /// Inserts `samplesPerHour` records into each of the most recent `hours` hours.
++    func testHourCoverage(samplesPerHour: Int, hours: Int) async throws -> Bool {
++        let now = Date()
++
++        try await context.perform {
++            for hour in 0 ..< hours {
++                for sample in 0 ..< samplesPerHour {
++                    let tdd = TDDStored(context: context)
++                    tdd.date = now - Double(hour * 3600 + sample * 300 + 60)
++                    tdd.total = 30
++                    tdd.bolus = 15
++                    tdd.tempBasal = 15
++                    tdd.scheduledBasal = 0
++                }
++            }
++
++            try context.save()
++        }
++
++        return try await BaseTDDStorage.hasSufficientTDD(context: context)
++    }
++
++    @Test("Skipped cycles spread across all 7 days (8 of 12 per hour, 67%) enable Dynamic ISF")
++    func testScatteredSkipsEnable() async throws {
++        let enabled = try await testHourCoverage(samplesPerHour: 8, hours: 168)
++        #expect(enabled)
++    }
++
++    @Test("Exactly half the cycles in every hour (6 of 12) enable Dynamic ISF")
++    func testHalfPerHourEnables() async throws {
++        let enabled = try await testHourCoverage(samplesPerHour: 6, hours: 168)
++        #expect(enabled)
++    }
++
++    @Test("Sparse looping (5 of 12 per hour) keeps Dynamic ISF disabled")
++    func testSparseLoopingDisables() async throws {
++        let enabled = try await testHourCoverage(samplesPerHour: 5, hours: 168)
++        #expect(!enabled)
++    }
++
++    @Test("Full looping for only 5 days (120 of 168 hours) keeps Dynamic ISF disabled")
++    func testTooFewDaysDisables() async throws {
++        let enabled = try await testHourCoverage(samplesPerHour: 12, hours: 120)
++        #expect(!enabled)
++    }
++
++    @Test("Full looping for 126 hours (exactly 75%) enables Dynamic ISF")
++    func testThresholdHoursEnable() async throws {
++        let enabled = try await testHourCoverage(samplesPerHour: 12, hours: 126)
++        #expect(enabled)
++    }
+ }
